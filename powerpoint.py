@@ -2,7 +2,7 @@ from pathlib import Path
 from datetime import datetime
 
 from pptx import Presentation
-from pptx.enum.shapes import MSO_SHAPE
+from pptx.enum.shapes import MSO_SHAPE_TYPE, MSO_SHAPE
 from pptx.enum.text import PP_ALIGN, MSO_ANCHOR
 from pptx.dml.color import RGBColor
 from pptx.util import Pt
@@ -20,10 +20,7 @@ TEMPLATE_PATH = (
     / "slide06_template.pptx"
 )
 
-OUTPUT_DIR = (
-    BASE_DIR
-    / "output"
-)
+OUTPUT_DIR = BASE_DIR / "output"
 
 
 # =========================================================
@@ -35,27 +32,102 @@ WHITE = RGBColor(255, 255, 255)
 
 ORANGE = RGBColor(255, 121, 0)
 GREEN = RGBColor(80, 190, 135)
-BLUE = RGBColor(75, 180, 230)
-
 GREY = RGBColor(191, 191, 191)
 
 
 # =========================================================
-# HELPERS
+# BASELINE VALUES ALREADY PRINTED IN TEMPLATE
 # =========================================================
 
-def pct0(value):
-    if value is None:
-        return "N/A"
+# These values already exist inside the flattened
+# reference images. If the newly calculated value is
+# identical, we do NOT overlay anything.
 
-    return f"{round(value * 100):.0f}%"
+BASELINE_KPIS = {
+    "hc_tagged": 656,
+    "total_hc": 761,
+    "completion_rate": 0.96,
+    "hc_compliance": 0.96,
+    "arve": 0.86,
+    "arvi": 0.83,
+    "overbooking": 0.09,
+}
 
 
-def k_value(value):
-    return f"{round(value / 1000):.0f}K"
+BASELINE_WORKTYPE = {
+    "Billable": {
+        "k": 23,
+        "pct": 87,
+    },
+    "General": {
+        "k": 2,
+        "pct": 7,
+    },
+    "Leave": {
+        "k": 1,
+        "pct": 4,
+    },
+    "Pre-sales": {
+        "k": 0,
+        "pct": 1,
+    },
+}
 
 
-def add_overlay_text(
+BASELINE_TREND = {
+    1: 81,
+    2: 82,
+    3: 84,
+    4: 85,
+    5: 86,
+    6: 87,
+    7: 86,
+    8: 87,
+    9: 91,
+}
+
+
+# =========================================================
+# GENERIC HELPERS
+# =========================================================
+
+def pct_int(value):
+    return int(round(float(value) * 100))
+
+
+def k_int(value):
+    return int(round(float(value) / 1000))
+
+
+def add_patch(
+    slide,
+    left,
+    top,
+    width,
+    height,
+    color,
+):
+    """
+    Covers old text in a flattened image.
+    """
+
+    patch = slide.shapes.add_shape(
+        MSO_SHAPE.RECTANGLE,
+        int(left),
+        int(top),
+        int(width),
+        int(height),
+    )
+
+    patch.fill.solid()
+    patch.fill.fore_color.rgb = color
+
+    patch.line.fill.background()
+
+    return patch
+
+
+def add_text(
     slide,
     left,
     top,
@@ -65,36 +137,19 @@ def add_overlay_text(
     font_size,
     font_color=WHITE,
     bold=True,
-    fill_color=None,
 ):
     """
-    Adds a textbox over an existing flattened reference image.
-    Optional fill_color can be used to hide the original value.
+    Adds replacement text.
     """
 
-    if fill_color is not None:
-
-        patch = slide.shapes.add_shape(
-            MSO_SHAPE.RECTANGLE,
-            left,
-            top,
-            width,
-            height,
-        )
-
-        patch.fill.solid()
-        patch.fill.fore_color.rgb = fill_color
-        patch.line.fill.background()
-
-
-    textbox = slide.shapes.add_textbox(
-        left,
-        top,
-        width,
-        height,
+    box = slide.shapes.add_textbox(
+        int(left),
+        int(top),
+        int(width),
+        int(height),
     )
 
-    frame = textbox.text_frame
+    frame = box.text_frame
     frame.clear()
 
     frame.margin_left = 0
@@ -102,22 +157,54 @@ def add_overlay_text(
     frame.margin_top = 0
     frame.margin_bottom = 0
 
-    frame.vertical_anchor = (
-        MSO_ANCHOR.MIDDLE
-    )
+    frame.vertical_anchor = MSO_ANCHOR.MIDDLE
 
     paragraph = frame.paragraphs[0]
     paragraph.alignment = PP_ALIGN.CENTER
 
     run = paragraph.add_run()
-    run.text = text
+    run.text = str(text)
 
     run.font.name = "Arial"
     run.font.size = Pt(font_size)
     run.font.bold = bold
     run.font.color.rgb = font_color
 
-    return textbox
+    return box
+
+
+def patch_and_write(
+    slide,
+    left,
+    top,
+    width,
+    height,
+    text,
+    font_size,
+    background=BLACK,
+    font_color=WHITE,
+    bold=True,
+):
+    add_patch(
+        slide,
+        left,
+        top,
+        width,
+        height,
+        background,
+    )
+
+    return add_text(
+        slide,
+        left,
+        top,
+        width,
+        height,
+        text,
+        font_size,
+        font_color,
+        bold,
+    )
 
 
 # =========================================================
@@ -129,7 +216,7 @@ def update_title(
     reporting_period,
 ):
 
-    new_title = (
+    wanted = (
         "CSU Prime Dashboard – "
         + reporting_period
     )
@@ -139,20 +226,19 @@ def update_title(
         if not shape.has_text_frame:
             continue
 
-        if (
-            "CSU Prime Dashboard"
-            in shape.text
-        ):
+        if "CSU Prime Dashboard" in shape.text:
+
+            # Do nothing if title already matches.
+            if shape.text.strip() == wanted.strip():
+                return
 
             frame = shape.text_frame
-
-            # Do not append to existing text.
             frame.clear()
 
             paragraph = frame.paragraphs[0]
             run = paragraph.add_run()
 
-            run.text = new_title
+            run.text = wanted
 
             return
 
@@ -162,16 +248,20 @@ def update_title(
 
 
 # =========================================================
-# FIND REFERENCE IMAGES
+# FIND TEMPLATE IMAGES
 # =========================================================
 
 def find_reference_images(slide):
 
-    images = {
-        shape.name: shape
-        for shape in slide.shapes
-        if shape.shape_type == 13
-    }
+    images = {}
+
+    for shape in slide.shapes:
+
+        if (
+            shape.shape_type
+            == MSO_SHAPE_TYPE.PICTURE
+        ):
+            images[shape.name] = shape
 
     required = [
         "Image 2",
@@ -195,10 +285,10 @@ def find_reference_images(slide):
 
 
 # =========================================================
-# KPI OVERLAYS
+# KPI SECTION
 # =========================================================
 
-def overlay_kpis(
+def update_kpis(
     slide,
     image,
     metrics,
@@ -206,32 +296,87 @@ def overlay_kpis(
 
     k = metrics["kpis"]
 
-    values = [
-        (
-            str(k["hc_tagged"]),
-            WHITE,
-        ),
-        (
-            pct0(k["completion_rate"]),
-            GREEN,
-        ),
-        (
-            pct0(k["hc_compliance"]),
-            GREEN,
-        ),
-        (
-            pct0(k["arve"]),
-            WHITE,
-        ),
-        (
-            pct0(k["arvi"]),
-            WHITE,
-        ),
-        (
-            pct0(k["overbooking"]),
-            ORANGE,
-        ),
-    ]
+    current = {
+        "hc_tagged":
+            int(k["hc_tagged"]),
+
+        "total_hc":
+            int(k["total_hc"]),
+
+        "completion_rate":
+            pct_int(
+                k["completion_rate"]
+            ),
+
+        "hc_compliance":
+            pct_int(
+                k["hc_compliance"]
+            ),
+
+        "arve":
+            pct_int(
+                k["arve"]
+            ),
+
+        "arvi":
+            pct_int(
+                k["arvi"]
+            ),
+
+        "overbooking":
+            pct_int(
+                k["overbooking"]
+            ),
+    }
+
+
+    baseline = {
+        "hc_tagged":
+            BASELINE_KPIS[
+                "hc_tagged"
+            ],
+
+        "total_hc":
+            BASELINE_KPIS[
+                "total_hc"
+            ],
+
+        "completion_rate":
+            pct_int(
+                BASELINE_KPIS[
+                    "completion_rate"
+                ]
+            ),
+
+        "hc_compliance":
+            pct_int(
+                BASELINE_KPIS[
+                    "hc_compliance"
+                ]
+            ),
+
+        "arve":
+            pct_int(
+                BASELINE_KPIS[
+                    "arve"
+                ]
+            ),
+
+        "arvi":
+            pct_int(
+                BASELINE_KPIS[
+                    "arvi"
+                ]
+            ),
+
+        "overbooking":
+            pct_int(
+                BASELINE_KPIS[
+                    "overbooking"
+                ]
+            ),
+    }
+
 
     left = image.left
     top = image.top
@@ -240,128 +385,159 @@ def overlay_kpis(
 
     tile_width = width / 6
 
-    # Values sit around the lower-middle
-    # portion of each KPI tile.
-    for i, (
-        value,
-        color,
-    ) in enumerate(values):
 
-        x = int(
-            left
-            + tile_width * i
-            + tile_width * 0.12
-        )
-
-        y = int(
-            top
-            + height * 0.40
-        )
-
-        w = int(
-            tile_width * 0.76
-        )
-
-        h = int(
-            height * 0.43
-        )
-
-        add_overlay_text(
-            slide,
-            x,
-            y,
-            w,
-            h,
-            value,
-            font_size=22,
-            font_color=color,
-            bold=True,
-            fill_color=BLACK,
-        )
-
-
-    # HC total subtitle
-    add_overlay_text(
-        slide,
-        int(
-            left
-            + tile_width * 0.10
-        ),
-        int(
-            top
-            + height * 0.23
-        ),
-        int(
-            tile_width * 0.80
-        ),
-        int(
-            height * 0.18
+    items = [
+        (
+            "hc_tagged",
+            str(current["hc_tagged"]),
+            WHITE,
         ),
         (
-            f"(out of "
-            f"{k['total_hc']} "
-            f"total HC)"
+            "completion_rate",
+            f"{current['completion_rate']}%",
+            GREEN,
         ),
-        font_size=6,
-        font_color=GREY,
-        bold=False,
-        fill_color=BLACK,
-    )
+        (
+            "hc_compliance",
+            f"{current['hc_compliance']}%",
+            GREEN,
+        ),
+        (
+            "arve",
+            f"{current['arve']}%",
+            WHITE,
+        ),
+        (
+            "arvi",
+            f"{current['arvi']}%",
+            WHITE,
+        ),
+        (
+            "overbooking",
+            f"{current['overbooking']}%",
+            ORANGE,
+        ),
+    ]
+
+
+    for index, (
+        key,
+        value_text,
+        color,
+    ) in enumerate(items):
+
+        # If already identical to template,
+        # do absolutely nothing.
+        if current[key] == baseline[key]:
+            continue
+
+        patch_and_write(
+            slide,
+
+            left
+            + tile_width * index
+            + tile_width * 0.16,
+
+            top
+            + height * 0.39,
+
+            tile_width * 0.68,
+
+            height * 0.40,
+
+            value_text,
+
+            font_size=22,
+
+            background=BLACK,
+            font_color=color,
+            bold=True,
+        )
+
+
+    # HC total subtitle only changes
+    # if total HC changes.
+    if (
+        current["total_hc"]
+        != baseline["total_hc"]
+    ):
+
+        patch_and_write(
+            slide,
+
+            left
+            + tile_width * 0.13,
+
+            top
+            + height * 0.20,
+
+            tile_width * 0.74,
+
+            height * 0.16,
+
+            (
+                f"(out of "
+                f"{current['total_hc']} "
+                f"total HC)"
+            ),
+
+            font_size=6,
+
+            background=BLACK,
+            font_color=GREY,
+            bold=False,
+        )
 
 
 # =========================================================
-# WORKTYPE LABEL OVERLAYS
+# WORKTYPE SECTION
 # =========================================================
 
-def overlay_worktype_labels(
+def update_worktypes(
     slide,
     image,
     metrics,
 ):
 
-    w = metrics["worktypes"]
+    data = metrics["worktypes"]
 
-    total = w["Total"]
+    total = float(
+        data["Total"]
+    )
 
     if total <= 0:
         raise ValueError(
             "Worktype total is zero."
         )
 
-    labels = {
-        "Billable": (
-            w["Billable"],
-            round(
-                w["Billable"]
-                / total
-                * 100
-            ),
-        ),
-        "General": (
-            w["General"],
-            round(
-                w["General"]
-                / total
-                * 100
-            ),
-        ),
-        "Leave": (
-            w["Leave"],
-            round(
-                w["Leave"]
-                / total
-                * 100
-            ),
-        ),
-        "Pre-sales": (
-            w["Pre-sales"],
-            round(
-                w["Pre-sales"]
-                / total
-                * 100
-            ),
-        ),
-    }
+
+    values = {}
+
+    for name in [
+        "Billable",
+        "General",
+        "Leave",
+        "Pre-sales",
+    ]:
+
+        raw = float(
+            data[name]
+        )
+
+        values[name] = {
+            "k":
+                k_int(raw),
+
+            "pct":
+                int(
+                    round(
+                        raw
+                        / total
+                        * 100
+                    )
+                ),
+        }
+
 
     left = image.left
     top = image.top
@@ -369,99 +545,172 @@ def overlay_worktype_labels(
     height = image.height
 
 
-    # Billable label — lower-right
-    value, percent = labels["Billable"]
+    # -------------------------------------------------
+    # BILLABLE
+    # -------------------------------------------------
 
-    add_overlay_text(
-        slide,
-        int(left + width * 0.51),
-        int(top + height * 0.72),
-        int(width * 0.30),
-        int(height * 0.12),
-        (
-            f"Billable "
-            f"{k_value(value)} "
-            f"({percent}%)"
-        ),
-        font_size=7,
-        font_color=WHITE,
-        bold=False,
-        fill_color=BLACK,
-    )
+    if (
+        values["Billable"]
+        != BASELINE_WORKTYPE[
+            "Billable"
+        ]
+    ):
 
+        patch_and_write(
+            slide,
 
-    # General label — upper-left
-    value, percent = labels["General"]
+            left
+            + width * 0.50,
 
-    add_overlay_text(
-        slide,
-        int(left + width * 0.05),
-        int(top + height * 0.17),
-        int(width * 0.34),
-        int(height * 0.10),
-        (
-            f"General "
-            f"{k_value(value)} "
-            f"({percent}%)"
-        ),
-        font_size=7,
-        font_color=WHITE,
-        bold=False,
-        fill_color=BLACK,
-    )
+            top
+            + height * 0.79,
+
+            width * 0.33,
+
+            height * 0.075,
+
+            (
+                f"Billable "
+                f"{values['Billable']['k']}K "
+                f"({values['Billable']['pct']}%)"
+            ),
+
+            font_size=7,
+
+            background=BLACK,
+            font_color=WHITE,
+            bold=False,
+        )
 
 
-    # Leave label
-    value, percent = labels["Leave"]
+    # -------------------------------------------------
+    # GENERAL
+    # -------------------------------------------------
 
-    add_overlay_text(
-        slide,
-        int(left + width * 0.13),
-        int(top + height * 0.10),
-        int(width * 0.28),
-        int(height * 0.09),
-        (
-            f"Leave "
-            f"{k_value(value)} "
-            f"({percent}%)"
-        ),
-        font_size=7,
-        font_color=WHITE,
-        bold=False,
-        fill_color=BLACK,
-    )
+    if (
+        values["General"]
+        != BASELINE_WORKTYPE[
+            "General"
+        ]
+    ):
+
+        patch_and_write(
+            slide,
+
+            left
+            + width * 0.07,
+
+            top
+            + height * 0.18,
+
+            width * 0.28,
+
+            height * 0.07,
+
+            (
+                f"General "
+                f"{values['General']['k']}K "
+                f"({values['General']['pct']}%)"
+            ),
+
+            font_size=7,
+
+            background=BLACK,
+            font_color=WHITE,
+            bold=False,
+        )
 
 
-    # Pre-sales label
-    value, percent = labels["Pre-sales"]
+    # -------------------------------------------------
+    # LEAVE
+    #
+    # For your current validated data it already
+    # equals the template, so nothing gets added.
+    # -------------------------------------------------
 
-    add_overlay_text(
-        slide,
-        int(left + width * 0.32),
-        int(top + height * 0.26),
-        int(width * 0.20),
-        int(height * 0.13),
-        (
-            f"Pre-sales\n"
-            f"{k_value(value)} "
-            f"({percent}%)"
-        ),
-        font_size=6,
-        font_color=WHITE,
-        bold=False,
-        fill_color=RGBColor(
-            85,
-            110,
-            120,
-        ),
-    )
+    if (
+        values["Leave"]
+        != BASELINE_WORKTYPE[
+            "Leave"
+        ]
+    ):
+
+        patch_and_write(
+            slide,
+
+            left
+            + width * 0.18,
+
+            top
+            + height * 0.125,
+
+            width * 0.23,
+
+            height * 0.07,
+
+            (
+                f"Leave "
+                f"{values['Leave']['k']}K "
+                f"({values['Leave']['pct']}%)"
+            ),
+
+            font_size=7,
+
+            background=BLACK,
+            font_color=WHITE,
+            bold=False,
+        )
+
+
+    # -------------------------------------------------
+    # PRE-SALES
+    #
+    # Current template already shows 0K (1%).
+    # Normally this therefore remains untouched.
+    # -------------------------------------------------
+
+    if (
+        values["Pre-sales"]
+        != BASELINE_WORKTYPE[
+            "Pre-sales"
+        ]
+    ):
+
+        # If it ever changes materially,
+        # place the replacement just above
+        # the pie rather than inside the slice.
+        patch_and_write(
+            slide,
+
+            left
+            + width * 0.36,
+
+            top
+            + height * 0.08,
+
+            width * 0.24,
+
+            height * 0.08,
+
+            (
+                f"Pre-sales "
+                f"{values['Pre-sales']['k']}K "
+                f"({values['Pre-sales']['pct']}%)"
+            ),
+
+            font_size=6,
+
+            background=BLACK,
+            font_color=WHITE,
+            bold=False,
+        )
 
 
 # =========================================================
-# BILLABILITY TREND OVERLAYS
+# TREND SECTION
 # =========================================================
 
-def overlay_billability(
+def update_trend(
     slide,
     image,
     metrics,
@@ -470,18 +719,7 @@ def overlay_billability(
     trend = metrics["trend"]
 
     if not trend:
-        raise ValueError(
-            "No billability trend."
-        )
-
-
-    ordered = sorted(
-        trend.items(),
-        key=lambda item:
-            item[1][
-                "month_number"
-            ],
-    )
+        return
 
 
     left = image.left
@@ -490,84 +728,76 @@ def overlay_billability(
     height = image.height
 
 
-    # Historical template contains
-    # 9 equally spaced monthly positions.
-    #
-    # For months represented in current Source A,
-    # overlay the calculated percentage.
-
-    slot_count = 9
-
-    slot_width = (
-        width
-        / slot_count
-    )
+    # Jan-Sep template = 9 fixed positions
+    slot_width = width / 9
 
 
-    for (
-        month_name,
-        values,
-    ) in ordered:
+    for _, values in sorted(
+        trend.items(),
+        key=lambda item:
+            item[1][
+                "month_number"
+            ],
+    ):
 
-        month_num = (
+        month = int(
             values[
                 "month_number"
             ]
         )
 
-        # Jan=0 ... Sep=8
-        index = (
-            month_num - 1
+        if month not in BASELINE_TREND:
+            continue
+
+
+        calculated = int(
+            round(
+                values[
+                    "billable_pct"
+                ]
+                * 100
+            )
         )
 
-        # Ignore months beyond Sep
-        # for this exact historical template.
+
+        # If the number already printed in
+        # the reference image is correct,
+        # leave it untouched.
         if (
-            index < 0
-            or index >= slot_count
+            calculated
+            == BASELINE_TREND[
+                month
+            ]
         ):
             continue
 
 
-        billable = round(
-            values[
-                "billable_pct"
-            ]
-            * 100
-        )
+        index = month - 1
 
 
-        x = int(
+        # Text is inside the orange section.
+        # Use orange patch rather than black.
+        patch_and_write(
+            slide,
+
             left
             + slot_width * index
-            + slot_width * 0.16
-        )
+            + slot_width * 0.26,
 
-        y = int(
             top
-            + height * 0.36
-        )
+            + height * 0.44,
 
-        w = int(
-            slot_width * 0.68
-        )
+            slot_width * 0.48,
 
-        h = int(
-            height * 0.18
-        )
+            height * 0.10,
 
+            f"{calculated}%",
 
-        add_overlay_text(
-            slide,
-            x,
-            y,
-            w,
-            h,
-            f"{billable}%",
-            font_size=7,
+            font_size=6,
+
+            background=ORANGE,
             font_color=WHITE,
             bold=True,
-            fill_color=ORANGE,
         )
 
 
@@ -613,18 +843,12 @@ def build_powerpoint(
     )
 
 
-    # ---------------------------------------------
-    # Open exact approved reference
-    # ---------------------------------------------
-
     prs = Presentation(
         TEMPLATE_PATH
     )
 
 
-    if len(
-        prs.slides
-    ) != 1:
+    if len(prs.slides) != 1:
 
         raise ValueError(
             "Template must contain "
@@ -632,14 +856,8 @@ def build_powerpoint(
         )
 
 
-    slide = (
-        prs.slides[0]
-    )
+    slide = prs.slides[0]
 
-
-    # ---------------------------------------------
-    # Find original flattened graphics
-    # ---------------------------------------------
 
     (
         kpi_image,
@@ -650,10 +868,6 @@ def build_powerpoint(
     )
 
 
-    # ---------------------------------------------
-    # Update title
-    # ---------------------------------------------
-
     update_title(
         slide,
         metrics[
@@ -662,35 +876,26 @@ def build_powerpoint(
     )
 
 
-    # ---------------------------------------------
-    # Preserve all original graphics.
-    # Overlay current values only.
-    # ---------------------------------------------
-
-    overlay_kpis(
+    update_kpis(
         slide,
         kpi_image,
         metrics,
     )
 
 
-    overlay_worktype_labels(
+    update_worktypes(
         slide,
         worktype_image,
         metrics,
     )
 
 
-    overlay_billability(
+    update_trend(
         slide,
         trend_image,
         metrics,
     )
 
-
-    # ---------------------------------------------
-    # Save
-    # ---------------------------------------------
 
     prs.save(
         output_file

@@ -1,955 +1,540 @@
 from pathlib import Path
 import json
+import os
+from collections import Counter
+
 import pandas as pd
 
 
 BASE_DIR = Path(__file__).parent
 OUTPUT_DIR = BASE_DIR / "output"
 
+# Total HC is not present in Source A or Source B.
+# Keep one stable deployment-level default and optionally override it
+# in Streamlit/hosting environment with CSU_TOTAL_HC.
+DEFAULT_TOTAL_HC = int(os.getenv("CSU_TOTAL_HC", "761"))
 
-# =========================================================
-# INTERNAL SOURCE C — POC CONTROL DATA
-# =========================================================
-#
-# This is temporary for the PoC.
-#
-# Later this should be replaced by the controlled internal
-# monthly HC / capacity source.
-#
-# Format:
-# YYYY-MM
-# =========================================================
 
-SOURCE_C = {
-    "2026-07": {
-        "hc_tagged": 656,
-        "total_hc": 761,
-        "expected_working_days": 23,
-    },
-    "2026-08": {
-        "hc_tagged": 656,
-        "total_hc": 761,
-        "expected_working_days": 21,
-    },
+MONTH_NAMES = {
+    1: "January",
+    2: "February",
+    3: "March",
+    4: "April",
+    5: "May",
+    6: "June",
+    7: "July",
+    8: "August",
+    9: "September",
+    10: "October",
+    11: "November",
+    12: "December",
 }
 
 
-# =========================================================
-# GENERIC HELPERS
-# =========================================================
+SOURCE_A_REQUIRED = [
+    "Legal Entity Name",
+    "Work Type Name",
+    "Timesheets Billable",
+    "Timesheets Non Billable",
+    "All Timesheets",
+    "Completion %",
+    "Man Period Name",
+]
+
+SOURCE_B_REQUIRED = [
+    "Person Number",
+    "Mois",
+    "Year",
+    "Time Entry",
+]
+
+
+def _clean_header(value):
+    if value is None:
+        return ""
+    return " ".join(str(value).replace("\n", " ").split()).strip()
+
 
 def load_sheet_containing_columns(path, required_columns):
+    """
+    Load the worksheet that contains all required columns.
 
+    Handles ordinary header rows and also tolerates a few title rows
+    above the real Excel header.
+    """
     path = Path(path)
-
     if not path.exists():
-        raise FileNotFoundError(
-            f"Input file not found: {path}"
+        raise FileNotFoundError(f"Input file not found: {path}")
+
+    excel = pd.ExcelFile(path, engine="openpyxl")
+    required = {_clean_header(c) for c in required_columns}
+
+    diagnostics = []
+
+    for sheet_name in excel.sheet_names:
+        preview = pd.read_excel(
+            path,
+            sheet_name=sheet_name,
+            header=None,
+            nrows=20,
+            engine="openpyxl",
         )
 
-    workbook = pd.read_excel(
-        path,
-        sheet_name=None,
-    )
+        for header_row in range(len(preview)):
+            headers = [_clean_header(v) for v in preview.iloc[header_row].tolist()]
+            header_set = {h for h in headers if h}
 
-    for sheet_name, df in workbook.items():
+            if required.issubset(header_set):
+                df = pd.read_excel(
+                    path,
+                    sheet_name=sheet_name,
+                    header=header_row,
+                    engine="openpyxl",
+                )
+                df.columns = [_clean_header(c) for c in df.columns]
+                return df
 
-        df.columns = [
-            str(c).strip()
-            for c in df.columns
-        ]
-
-        if all(
-            col in df.columns
-            for col in required_columns
-        ):
-
-            print(
-                f"✓ Using worksheet "
-                f"'{sheet_name}' from {path.name}"
-            )
-
-            return df.copy()
+        diagnostics.append(sheet_name)
 
     raise ValueError(
-        f"Could not identify the required worksheet "
-        f"in {path.name}.\n"
-        f"Required columns: {required_columns}"
+        f"Could not identify the required worksheet in {path.name}. "
+        f"Required columns: {required_columns}. "
+        f"Checked sheets: {diagnostics}"
     )
 
 
 def numeric(series):
+    return pd.to_numeric(series, errors="coerce").fillna(0.0)
 
-    return pd.to_numeric(
-        series,
-        errors="coerce",
-    ).fillna(0)
+
+def normalize_completion(series):
+    """
+    Completion % is already stored as a decimal ratio in Source A.
+    Values above 1 are valid (for example 1.105263 = 110.5263%).
+    Do not divide values above 1 by 100.
+    """
+    return pd.to_numeric(series, errors="coerce")
 
 
 def normalize_month_name(value):
-
+    """Return month number from Source A Man Period Name such as 07-26."""
     if pd.isna(value):
         return None
 
-    if isinstance(value, pd.Timestamp):
-        return value.month
-
     text = str(value).strip()
 
-    # Explicit MM-YY format
-    # Example: 07-26
-
+    # Explicit MM-YY format used by Source A.
     parts = text.split("-")
+    if len(parts) >= 2 and parts[0].strip().isdigit():
+        month = int(parts[0].strip())
+        if 1 <= month <= 12:
+            return month
 
-    if len(parts) == 2:
+    parsed = pd.to_datetime(text, errors="coerce")
+    if pd.notna(parsed):
+        return int(parsed.month)
 
-        try:
-            month = int(parts[0])
-
-            if 1 <= month <= 12:
-                return month
-
-        except Exception:
-            pass
-
-    # Fallback
-
-    try:
-
-        parsed = pd.to_datetime(
-            text,
-            errors="raise",
-        )
-
-        return parsed.month
-
-    except Exception:
-
-        return None
+    return None
 
 
 def normalize_year(value):
-
+    """Return four-digit year from Source A Man Period Name such as 07-26."""
     if pd.isna(value):
         return None
 
-    if isinstance(value, pd.Timestamp):
-        return value.year
-
     text = str(value).strip()
-
-    # Explicit MM-YY format
-    # Example: 07-26 -> 2026
-
     parts = text.split("-")
 
-    if len(parts) == 2:
+    if len(parts) >= 2 and parts[1].strip().isdigit():
+        year = int(parts[1].strip())
+        if year < 100:
+            year += 2000
+        return year
 
-        try:
+    parsed = pd.to_datetime(text, errors="coerce")
+    if pd.notna(parsed):
+        return int(parsed.year)
 
-            year = int(parts[1])
+    return None
 
-            if year < 100:
-                year += 2000
-
-            return year
-
-        except Exception:
-            pass
-
-    # Fallback
-
-    try:
-
-        parsed = pd.to_datetime(
-            text,
-            errors="raise",
-        )
-
-        return parsed.year
-
-    except Exception:
-
-        return None
-
-
-def normalize_completion(value):
-
-    """
-    Source A Completion % is already stored
-    as a decimal ratio.
-
-    Examples:
-
-    0.96 = 96%
-    1.10 = 110%
-
-    Do NOT divide values above 1 by 100.
-    """
-
-    try:
-        return float(value)
-
-    except Exception:
-        return 0
-
-
-# =========================================================
-# SOURCE A
-# =========================================================
 
 def load_source_a(source_a_path):
-
-    required = [
-        "Legal Entity Name",
-        "Work Type Name",
-        "Timesheets Billable",
-        "Timesheets Non Billable",
-        "All Timesheets",
-        "Completion %",
-        "Man Period Name",
-    ]
-
-    df = load_sheet_containing_columns(
-        source_a_path,
-        required,
-    )
-
-    df["MonthNum"] = (
-        df["Man Period Name"]
-        .apply(normalize_month_name)
-    )
-
-    df["YearNum"] = (
-        df["Man Period Name"]
-        .apply(normalize_year)
-    )
+    df = load_sheet_containing_columns(source_a_path, SOURCE_A_REQUIRED).copy()
 
     for col in [
         "Timesheets Billable",
         "Timesheets Non Billable",
         "All Timesheets",
     ]:
+        df[col] = numeric(df[col])
 
-        df[col] = numeric(
-            df[col]
-        )
+    df["Completion %"] = normalize_completion(df["Completion %"])
+    df["_month"] = df["Man Period Name"].apply(normalize_month_name)
+    df["_year"] = df["Man Period Name"].apply(normalize_year)
 
-    df["CompletionDecimal"] = (
-        df["Completion %"]
-        .apply(normalize_completion)
-    )
-
-    df["Work Type Name"] = (
-        df["Work Type Name"]
-        .astype(str)
-        .str.strip()
-    )
+    df = df[df["_month"].notna() & df["_year"].notna()].copy()
+    df["_month"] = df["_month"].astype(int)
+    df["_year"] = df["_year"].astype(int)
 
     return df
 
 
-# =========================================================
-# SOURCE B
-# =========================================================
+def _normalize_source_b_month(value):
+    if pd.isna(value):
+        return None
+
+    text = str(value).strip()
+    if not text:
+        return None
+
+    try:
+        month = int(float(text))
+    except (TypeError, ValueError):
+        return None
+
+    return month if 1 <= month <= 12 else None
+
 
 def load_source_b(source_b_path):
+    df = load_sheet_containing_columns(source_b_path, SOURCE_B_REQUIRED).copy()
 
-    required = [
-        "Person Number",
-        "Mois",
-        "Year",
-        "Time Entry",
-    ]
+    df["_month"] = df["Mois"].apply(_normalize_source_b_month)
+    df["_year"] = pd.to_numeric(df["Year"], errors="coerce")
+    df["_time_entry"] = numeric(df["Time Entry"])
+    df["_person"] = df["Person Number"].astype(str).str.strip()
 
-    df = load_sheet_containing_columns(
-        source_b_path,
-        required,
-    )
+    df = df[
+        df["_month"].notna()
+        & df["_year"].notna()
+        & df["_person"].ne("")
+        & df["_person"].ne("nan")
+    ].copy()
 
-    df["Mois"] = pd.to_numeric(
-        df["Mois"],
-        errors="coerce",
-    )
-
-    df["Year"] = pd.to_numeric(
-        df["Year"],
-        errors="coerce",
-    )
-
-    df["Time Entry"] = numeric(
-        df["Time Entry"]
-    )
+    df["_month"] = df["_month"].astype(int)
+    df["_year"] = df["_year"].astype(int)
 
     return df
 
 
-# =========================================================
-# DASHBOARD CALCULATION
-# =========================================================
+def _infer_expected_working_days(person_totals):
+    """
+    Infer the month's expected working days from Source B.
 
-def calculate_dashboard(
-    a,
-    b,
-    reporting_year,
-    reporting_months,
-):
-
-    reporting_months = sorted(
-        reporting_months
-    )
-
-    month_names = {
-        1: "January",
-        2: "February",
-        3: "March",
-        4: "April",
-        5: "May",
-        6: "June",
-        7: "July",
-        8: "August",
-        9: "September",
-        10: "October",
-        11: "November",
-        12: "December",
-    }
-
-
-    # =====================================================
-    # REPORTING PERIOD
-    # =====================================================
-
-    period_a = a[
-        (a["YearNum"] == reporting_year)
-        &
-        (
-            a["MonthNum"]
-            .isin(reporting_months)
-        )
-    ].copy()
-
-    if period_a.empty:
-
-        available_periods = (
-            a[
-                [
-                    "Man Period Name",
-                    "MonthNum",
-                    "YearNum",
-                ]
-            ]
-            .drop_duplicates()
-            .to_dict("records")
-        )
-
-        raise ValueError(
-            "No Source A data found for "
-            "the requested reporting period.\n"
-            f"Requested year: {reporting_year}\n"
-            f"Requested months: {reporting_months}\n"
-            f"Detected periods: {available_periods}"
-        )
-
-
-    # =====================================================
-    # BILLABILITY TREND
-    # =====================================================
-
-    trend = {}
-
-    year_a = a[
-        a["YearNum"]
-        == reporting_year
+    Source B contains multiple rows per person. After summing Time Entry
+    by person/month, the normal monthly entitlement is the dominant total
+    (e.g. 22 days for September 2026). This avoids a monthly hard-coded
+    calendar table and remains robust to leave, partial months and overbooking.
+    """
+    rounded = [
+        round(float(v), 4)
+        for v in person_totals
+        if pd.notna(v) and float(v) > 0
     ]
 
-    available_months = sorted(
-        int(x)
-        for x in year_a[
-            "MonthNum"
-        ]
-        .dropna()
-        .unique()
-    )
-
-    for month in available_months:
-
-        month_df = year_a[
-            year_a["MonthNum"]
-            == month
-        ]
-
-        total = (
-            month_df[
-                "All Timesheets"
-            ]
-            .sum()
-        )
-
-        if total <= 0:
-            continue
-
-        billable = (
-            month_df[
-                "Timesheets Billable"
-            ]
-            .sum()
-        )
-
-        non_billable = (
-            month_df[
-                "Timesheets Non Billable"
-            ]
-            .sum()
-        )
-
-        trend[
-            month_names[month]
-        ] = {
-
-            "month_number":
-                month,
-
-            "all_timesheets":
-                float(total),
-
-            "billable_time":
-                float(billable),
-
-            "non_billable_time":
-                float(non_billable),
-
-            "billable_pct":
-                float(
-                    billable
-                    / total
-                ),
-
-            "non_billable_pct":
-                float(
-                    non_billable
-                    / total
-                ),
-        }
-
-
-    # =====================================================
-    # WORK TYPES
-    # =====================================================
-
-    worktype_lower = (
-        period_a[
-            "Work Type Name"
-        ]
-        .str.lower()
-        .str.strip()
-    )
-
-
-    billable_worktype = (
-        period_a.loc[
-            worktype_lower.isin(
-                {
-                    "billable",
-                    "own work capitalized",
-                }
-            ),
-            "All Timesheets",
-        ]
-        .sum()
-    )
-
-
-    general = (
-        period_a.loc[
-            worktype_lower.isin(
-                {
-                    "administrative",
-                    "non billable",
-                }
-            ),
-            "All Timesheets",
-        ]
-        .sum()
-    )
-
-
-    leave = (
-        period_a.loc[
-            worktype_lower
-            == "leave",
-            "All Timesheets",
-        ]
-        .sum()
-    )
-
-
-    presales = (
-        period_a.loc[
-            worktype_lower.isin(
-                {
-                    "pre sales",
-                    "pre-sales",
-                    "presales",
-                }
-            ),
-            "All Timesheets",
-        ]
-        .sum()
-    )
-
-
-    sickness = (
-        period_a.loc[
-            worktype_lower
-            == "sickness",
-            "All Timesheets",
-        ]
-        .sum()
-    )
-
-
-    actual_reported = (
-        period_a[
-            "All Timesheets"
-        ]
-        .sum()
-    )
-
-
-    # =====================================================
-    # EXPECTED CAPACITY
-    # =====================================================
-
-    expected_capacity = 0
-
-    grouped = period_a.groupby(
-        [
-            "Legal Entity Name",
-            "MonthNum",
-        ],
-        dropna=False,
-    )
-
-    for _, group in grouped:
-
-        entity_completion = (
-            group[
-                "CompletionDecimal"
-            ]
-            .sum()
-        )
-
-        entity_actual = (
-            group[
-                "All Timesheets"
-            ]
-            .sum()
-        )
-
-        if entity_completion > 0:
-
-            expected_capacity += (
-                entity_actual
-                / entity_completion
-            )
-
-
-    if expected_capacity <= 0:
-
+    if not rounded:
         raise ValueError(
-            "Expected capacity is zero "
-            "or invalid."
+            "Could not infer expected working days because Source B has no "
+            "positive Time Entry totals for the selected month."
         )
 
+    frequencies = Counter(rounded)
+    highest_frequency = max(frequencies.values())
+    modes = [value for value, count in frequencies.items() if count == highest_frequency]
 
-    # =====================================================
-    # COMPLETION / ARVI / ARVE
-    # =====================================================
+    # In the unlikely event of a tie, use the larger normal total.
+    expected = max(modes)
 
-    completion_rate = (
-        actual_reported
-        / expected_capacity
-    )
-
-    productive_time = (
-        billable_worktype
-    )
-
-    adjusted_capacity = (
-        expected_capacity
-        - leave
-        - sickness
-    )
-
-    if adjusted_capacity <= 0:
-
+    if expected <= 0 or expected > 31:
         raise ValueError(
-            "Adjusted capacity is "
-            "zero or invalid."
+            f"Inferred expected working days ({expected}) is outside a valid monthly range."
         )
 
-    arvi = (
-        productive_time
-        / expected_capacity
-    )
-
-    arve = (
-        productive_time
-        / adjusted_capacity
-    )
+    return float(expected)
 
 
-    # =====================================================
-    # SOURCE C
-    # =====================================================
+def _derive_source_b_controls(source_b, reporting_year, reporting_months):
+    year_data = source_b[source_b["_year"] == int(reporting_year)].copy()
 
-    source_c_rows = {}
+    if year_data.empty:
+        raise ValueError(f"Source B has no data for {reporting_year}.")
 
-    for month in reporting_months:
+    # Dynamic tagged-HC pool: unique people represented anywhere in the
+    # uploaded Source B file for the reporting year. This removes the old
+    # month-by-month SOURCE_C maintenance.
+    tagged_people = set(year_data["_person"].dropna().astype(str).str.strip())
+    tagged_people.discard("")
+    tagged_people.discard("nan")
+    hc_tagged = len(tagged_people)
 
-        key = (
-            f"{reporting_year}-"
-            f"{month:02d}"
-        )
+    if hc_tagged == 0:
+        raise ValueError("Could not derive tagged HC from Source B.")
 
-        if key not in SOURCE_C:
+    controls = {}
 
+    for month in sorted(set(int(m) for m in reporting_months)):
+        month_data = year_data[year_data["_month"] == month].copy()
+
+        if month_data.empty:
             raise ValueError(
-                "Source C is missing "
-                "validated control data "
-                f"for {key}."
+                f"Source B has no data for {MONTH_NAMES[month]} {reporting_year}."
             )
-
-        source_c_rows[
-            month
-        ] = SOURCE_C[key]
-
-
-    # =====================================================
-    # HC COMPLIANCE
-    # =====================================================
-
-    submitters = {}
-
-    for month in reporting_months:
-
-        month_b = b[
-            (b["Mois"] == month)
-            &
-            (b["Year"] == reporting_year)
-        ]
-
-        submitters[
-            month
-        ] = int(
-            month_b[
-                "Person Number"
-            ]
-            .dropna()
-            .nunique()
-        )
-
-
-    hc_tagged_total = sum(
-        row["hc_tagged"]
-        for row
-        in source_c_rows.values()
-    )
-
-
-    hc_compliance = (
-        sum(
-            submitters.values()
-        )
-        /
-        hc_tagged_total
-    )
-
-
-    # =====================================================
-    # OVERBOOKING
-    # =====================================================
-
-    overbooking_occurrences = {}
-
-    for month in reporting_months:
-
-        month_b = b[
-            (b["Mois"] == month)
-            &
-            (b["Year"] == reporting_year)
-        ]
 
         person_totals = (
-            month_b
-            .groupby(
-                "Person Number"
-            )[
-                "Time Entry"
-            ]
+            month_data.groupby("_person", dropna=True)["_time_entry"]
             .sum()
+            .astype(float)
         )
 
-        expected_days = (
-            source_c_rows[
-                month
-            ][
-                "expected_working_days"
-            ]
-        )
+        expected_days = _infer_expected_working_days(person_totals.tolist())
 
-        overbooking_occurrences[
-            month
-        ] = int(
-            (
-                person_totals
-                > expected_days
-            )
-            .sum()
-        )
+        tolerance = 1e-9
+        compliant = int((person_totals >= expected_days - tolerance).sum())
+        overbooked = int((person_totals > expected_days + tolerance).sum())
 
-
-    overbooking_total = sum(
-        overbooking_occurrences.values()
-    )
-
-
-    first_month = (
-        reporting_months[0]
-    )
-
-
-    # Current agreed convention:
-    # total occurrences / HC tagged
-    # of first month
-
-    overbooking_pct = (
-        overbooking_total
-        /
-        source_c_rows[
-            first_month
-        ][
-            "hc_tagged"
-        ]
-    )
-
-
-    # =====================================================
-    # WORKTYPE RECONCILIATION
-    # =====================================================
-
-    displayed_total = (
-        billable_worktype
-        + general
-        + leave
-        + presales
-    )
-
-    non_displayed = (
-        actual_reported
-        - displayed_total
-    )
-
-
-    # =====================================================
-    # REPORTING PERIOD LABEL
-    # =====================================================
-
-    last_month = (
-        reporting_months[-1]
-    )
-
-    if (
-        first_month
-        == last_month
-    ):
-
-        reporting_period = (
-            f"{month_names[first_month]} "
-            f"{reporting_year}"
-        )
-
-    else:
-
-        reporting_period = (
-            f"{month_names[first_month]} "
-            f"& "
-            f"{month_names[last_month]} "
-            f"{reporting_year}"
-        )
-
-
-    # =====================================================
-    # RETURN RESULT
-    # =====================================================
+        controls[month] = {
+            "expected_working_days": expected_days,
+            "hc_compliant": compliant,
+            "overbooked": overbooked,
+            "reporting_people": int(person_totals.size),
+        }
 
     return {
-
-        "reporting_period":
-            reporting_period,
-
-        "reporting_year":
-            reporting_year,
-
-        "reporting_months":
-            reporting_months,
-
-
-        "kpis": {
-
-            "hc_tagged":
-                source_c_rows[
-                    first_month
-                ][
-                    "hc_tagged"
-                ],
-
-            "total_hc":
-                source_c_rows[
-                    first_month
-                ][
-                    "total_hc"
-                ],
-
-            "completion_rate":
-                float(
-                    completion_rate
-                ),
-
-            "hc_compliance":
-                float(
-                    hc_compliance
-                ),
-
-            "arve":
-                float(
-                    arve
-                ),
-
-            "arvi":
-                float(
-                    arvi
-                ),
-
-            "overbooking":
-                float(
-                    overbooking_pct
-                ),
-        },
-
-
-        "worktypes": {
-
-            "Billable":
-                float(
-                    billable_worktype
-                ),
-
-            "General":
-                float(
-                    general
-                ),
-
-            "Leave":
-                float(
-                    leave
-                ),
-
-            "Pre-sales":
-                float(
-                    presales
-                ),
-
-            "Non-displayed":
-                float(
-                    non_displayed
-                ),
-
-            "Total":
-                float(
-                    actual_reported
-                ),
-        },
-
-
-        "trend":
-            trend,
-
-
-        "diagnostics": {
-
-            "expected_capacity":
-                float(
-                    expected_capacity
-                ),
-
-            "actual_reported":
-                float(
-                    actual_reported
-                ),
-
-            "productive_time":
-                float(
-                    productive_time
-                ),
-
-            "leave":
-                float(
-                    leave
-                ),
-
-            "sickness":
-                float(
-                    sickness
-                ),
-
-            "submitters":
-                submitters,
-
-            "overbooking_occurrences":
-                overbooking_occurrences,
-
-            "overbooking_total":
-                int(
-                    overbooking_total
-                ),
-        },
+        "hc_tagged": hc_tagged,
+        "total_hc": DEFAULT_TOTAL_HC,
+        "months": controls,
     }
 
 
-# =========================================================
-# SAVE METRICS
-# =========================================================
+def _expected_capacity(source_a_filtered):
+    """
+    Reconstruct expected capacity exactly from Source A.
 
-def save_metrics(
-    metrics,
-    output_path=None,
-):
+    For every legal-entity/month combination, each non-zero worktype row
+    carries the same underlying capacity through:
+        All Timesheets / Completion %
+    We take the median candidate per entity/month to avoid duplicate counting,
+    then sum those capacities.
+    """
+    candidates = []
 
-    OUTPUT_DIR.mkdir(
-        parents=True,
-        exist_ok=True,
+    for (entity, year, month), group in source_a_filtered.groupby(
+        ["Legal Entity Name", "_year", "_month"],
+        dropna=False,
+    ):
+        valid = group[
+            group["Completion %"].notna()
+            & (group["Completion %"] > 0)
+            & (group["All Timesheets"] >= 0)
+        ].copy()
+
+        if valid.empty:
+            continue
+
+        capacity_candidates = (
+            valid["All Timesheets"] / valid["Completion %"]
+        ).replace([float("inf"), float("-inf")], pd.NA).dropna()
+
+        if not capacity_candidates.empty:
+            candidates.append(float(capacity_candidates.median()))
+
+    if not candidates:
+        raise ValueError(
+            "Could not derive expected capacity from Source A. "
+            "Check Completion % and All Timesheets values."
+        )
+
+    return float(sum(candidates))
+
+
+def _worktype_total(df, names):
+    names_normalized = {str(name).strip().lower() for name in names}
+    worktype = df["Work Type Name"].astype(str).str.strip().str.lower()
+    return float(df.loc[worktype.isin(names_normalized), "All Timesheets"].sum())
+
+
+def _month_label(month):
+    return MONTH_NAMES[int(month)]
+
+
+def _reporting_period(reporting_year, reporting_months):
+    months = sorted(set(int(m) for m in reporting_months))
+
+    if len(months) == 1:
+        return f"{_month_label(months[0])} {reporting_year}"
+
+    names = [_month_label(m) for m in months]
+    if len(names) == 2:
+        month_text = f"{names[0]} & {names[1]}"
+    else:
+        month_text = ", ".join(names[:-1]) + f" & {names[-1]}"
+
+    return f"{month_text} {reporting_year}"
+
+
+def calculate_dashboard(source_a, source_b, reporting_year, reporting_months):
+    reporting_year = int(reporting_year)
+    reporting_months = sorted(set(int(m) for m in reporting_months))
+
+    if not reporting_months:
+        raise ValueError("Select at least one reporting month.")
+
+    invalid_months = [m for m in reporting_months if m not in MONTH_NAMES]
+    if invalid_months:
+        raise ValueError(f"Invalid reporting month(s): {invalid_months}")
+
+    # -----------------------------------------------------
+    # Validate requested months in Source A first.
+    # -----------------------------------------------------
+    year_a = source_a[source_a["_year"] == reporting_year].copy()
+    available_a = sorted(year_a["_month"].dropna().astype(int).unique().tolist())
+    missing_a = [m for m in reporting_months if m not in available_a]
+
+    if missing_a:
+        missing_text = ", ".join(_month_label(m) for m in missing_a)
+        available_text = ", ".join(_month_label(m) for m in available_a) or "none"
+        raise ValueError(
+            f"Source A is missing {missing_text} {reporting_year}. "
+            f"Available Source A months: {available_text}."
+        )
+
+    selected_a = year_a[year_a["_month"].isin(reporting_months)].copy()
+
+    if selected_a.empty:
+        raise ValueError("No Source A data found for the selected reporting period.")
+
+    # -----------------------------------------------------
+    # Source-derived trend for every month available in A.
+    # -----------------------------------------------------
+    trend = {}
+
+    for month in available_a:
+        month_df = year_a[year_a["_month"] == month]
+        total = float(month_df["All Timesheets"].sum())
+        billable = float(month_df["Timesheets Billable"].sum())
+
+        billable_pct = (billable / total) if total else 0.0
+        trend[_month_label(month)] = {
+            "month_number": int(month),
+            "billable_pct": float(billable_pct),
+            "non_billable_pct": float(1.0 - billable_pct) if total else 0.0,
+        }
+
+    # -----------------------------------------------------
+    # Core Source A metrics.
+    # -----------------------------------------------------
+    actual_reported = float(selected_a["All Timesheets"].sum())
+    expected_capacity = _expected_capacity(selected_a)
+
+    billable_productive = _worktype_total(
+        selected_a,
+        ["Billable", "Own Work Capitalized"],
     )
+    general = _worktype_total(
+        selected_a,
+        ["Non Billable", "Administrative"],
+    )
+    leave = _worktype_total(selected_a, ["Leave"])
+    pre_sales = _worktype_total(selected_a, ["Pre Sales", "Pre-sales", "Presales"])
+    sickness = _worktype_total(selected_a, ["Sickness"])
+
+    completion_rate = (
+        actual_reported / expected_capacity
+        if expected_capacity else 0.0
+    )
+    arvi = (
+        billable_productive / expected_capacity
+        if expected_capacity else 0.0
+    )
+
+    arve_denominator = expected_capacity - leave - sickness
+    arve = (
+        billable_productive / arve_denominator
+        if arve_denominator > 0 else 0.0
+    )
+
+    # -----------------------------------------------------
+    # Dynamic Source B controls — replaces hard-coded SOURCE_C.
+    # -----------------------------------------------------
+    controls = _derive_source_b_controls(
+        source_b,
+        reporting_year,
+        reporting_months,
+    )
+
+    hc_tagged = int(controls["hc_tagged"])
+    total_hc = int(controls["total_hc"])
+
+    compliance_numerator = sum(
+        controls["months"][m]["hc_compliant"]
+        for m in reporting_months
+    )
+    compliance_denominator = hc_tagged * len(reporting_months)
+    hc_compliance = (
+        compliance_numerator / compliance_denominator
+        if compliance_denominator else 0.0
+    )
+
+    overbooked_count = sum(
+        controls["months"][m]["overbooked"]
+        for m in reporting_months
+    )
+    overbooking = (
+        overbooked_count / hc_tagged
+        if hc_tagged else 0.0
+    )
+
+    expected_working_days = {
+        _month_label(m): controls["months"][m]["expected_working_days"]
+        for m in reporting_months
+    }
+
+    metrics = {
+        "reporting_year": reporting_year,
+        "reporting_months": reporting_months,
+        "reporting_period": _reporting_period(reporting_year, reporting_months),
+        "kpis": {
+            "hc_tagged": hc_tagged,
+            "total_hc": total_hc,
+            "completion_rate": float(completion_rate),
+            "hc_compliance": float(hc_compliance),
+            "arve": float(arve),
+            "arvi": float(arvi),
+            "overbooking": float(overbooking),
+        },
+        "worktypes": {
+            "Billable": float(billable_productive),
+            "General": float(general),
+            "Leave": float(leave),
+            "Pre-sales": float(pre_sales),
+            "Total": float(actual_reported),
+        },
+        "trend": trend,
+        "details": {
+            "actual_reported": float(actual_reported),
+            "expected_capacity": float(expected_capacity),
+            "billable_productive_time": float(billable_productive),
+            "leave": float(leave),
+            "sickness": float(sickness),
+            "hc_compliance_numerator": int(compliance_numerator),
+            "hc_compliance_denominator": int(compliance_denominator),
+            "overbooked_count": int(overbooked_count),
+            "expected_working_days": expected_working_days,
+            "source_b_tagged_pool": int(hc_tagged),
+        },
+    }
+
+    return metrics
+
+
+def save_metrics(metrics, output_path=None):
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
     if output_path is None:
+        output_path = OUTPUT_DIR / "calculated_metrics.json"
+    else:
+        output_path = Path(output_path)
 
-        output_path = (
-            OUTPUT_DIR
-            / "calculated_metrics.json"
-        )
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(metrics, f, indent=2, ensure_ascii=False)
 
-    with open(
-        output_path,
-        "w",
-        encoding="utf-8",
-    ) as f:
-
-        json.dump(
-            metrics,
-            f,
-            indent=2,
-        )
-
-    return str(
-        output_path
-    )
+    return str(output_path)
